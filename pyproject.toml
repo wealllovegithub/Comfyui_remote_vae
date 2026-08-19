@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-remote-vae"
+description = "Offload ComfyUI video/audio VAE encode and decode to a slave machine."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = ["torch", "numpy"]
+
+[project.urls]
+Repository = "https://github.com/wealllovegithub/Comfyui_remote_vae"
+
+[tool.comfy]
+PublisherId = "wealllovegithub"
+DisplayName = "ComfyUI Remote VAE"

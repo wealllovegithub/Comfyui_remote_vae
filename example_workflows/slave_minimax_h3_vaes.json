@@ -1,0 +1,58 @@
+{
+  "last_node_id": 4,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VAELoader",
+      "pos": [0, 0],
+      "size": [360, 60],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [{"name": "VAE", "type": "VAE", "links": [1]}],
+      "properties": {},
+      "widgets_values": ["minimax_h3_video_vae_fp16.safetensors"]
+    },
+    {
+      "id": 2,
+      "type": "SendRemoteVAE",
+      "pos": [420, 0],
+      "size": [320, 120],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [{"name": "vae", "type": "VAE", "link": 1}],
+      "properties": {},
+      "widgets_values": [8182, "0.0.0.0", ""]
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [0, 200],
+      "size": [360, 60],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "outputs": [{"name": "VAE", "type": "VAE", "links": [2]}],
+      "properties": {},
+      "widgets_values": ["minimax_h3_audio_vae_fp32.safetensors"]
+    },
+    {
+      "id": 4,
+      "type": "SendRemoteVAE",
+      "pos": [420, 200],
+      "size": [320, 120],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [{"name": "vae", "type": "VAE", "link": 2}],
+      "properties": {},
+      "widgets_values": [8183, "0.0.0.0", ""]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "VAE"],
+    [2, 3, 0, 4, 0, "VAE"]
+  ]
+}
