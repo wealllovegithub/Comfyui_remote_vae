@@ -1,3 +1,4 @@
+import gc
 import hmac
 import os
 import socket
@@ -28,6 +29,109 @@ from .protocol import (
     set_socket_opts,
     unpack_tensors,
 )
+
+
+def _malloc_trim():
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _empty_device_cache():
+    gc.collect()
+    try:
+        comfy.model_management.soft_empty_cache()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    _malloc_trim()
+
+
+def _offload_vae_obj(vae):
+    """Move this VAE off GPU. Weights stay on CPU so the next encode/decode can reload."""
+    patcher = getattr(vae, "patcher", None)
+    if patcher is not None:
+        try:
+            comfy.model_management.unload_model_and_clones(patcher, unload_additional_models=True)
+        except Exception as exc:
+            log(f"VAE GPU unload: {exc}")
+            try:
+                patcher.unpatch_model()
+            except Exception:
+                pass
+            model = getattr(patcher, "model", None) or getattr(vae, "first_stage_model", None)
+            if model is not None:
+                try:
+                    model.to("cpu")
+                except Exception:
+                    pass
+    else:
+        model = getattr(vae, "first_stage_model", None)
+        if model is not None:
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+    _empty_device_cache()
+
+
+_CLEANUP_FNS_ATTR = "_remote_av_cleanup_fns"
+
+
+def _install_master_cleanup_hook(flush_fn):
+    try:
+        import execution
+    except Exception:
+        return
+    fns = getattr(execution.PromptExecutor, _CLEANUP_FNS_ATTR, None)
+    if fns is None:
+        fns = []
+        setattr(execution.PromptExecutor, _CLEANUP_FNS_ATTR, fns)
+        orig = execution.PromptExecutor.execute
+
+        def wrapped(self, *args, **kwargs):
+            try:
+                return orig(self, *args, **kwargs)
+            finally:
+                for fn in list(getattr(execution.PromptExecutor, _CLEANUP_FNS_ATTR, [])):
+                    try:
+                        fn()
+                    except Exception as exc:
+                        log(f"prompt-end CLIP/VAE cleanup: {exc}")
+
+        execution.PromptExecutor.execute = wrapped
+    if flush_fn not in fns:
+        fns.append(flush_fn)
+
+
+_MASTER_VAE_WORKERS = {}
+
+
+def _register_vae_worker(conn):
+    _MASTER_VAE_WORKERS[(conn.ip, conn.port)] = conn
+
+
+def _flush_vae_workers():
+    for (ip, port), conn in list(_MASTER_VAE_WORKERS.items()):
+        try:
+            log(f"Requesting VAE worker cleanup {ip}:{port}")
+            resp, _ = conn.request(
+                {"cmd": "cleanup", "proto": PROTOCOL_VERSION, "blob_size": 0},
+                retries=1,
+            )
+            if isinstance(resp, dict) and resp.get("error"):
+                log(f"VAE cleanup error from {ip}:{port}: {resp['error']}")
+            else:
+                log(f"VAE worker {ip}:{port} released GPU/RAM")
+        except Exception as exc:
+            log(f"VAE cleanup failed {ip}:{port}: {exc}")
 
 
 def _restore_kwargs(kwargs):
@@ -264,6 +368,17 @@ class _Worker:
                     )
         raise ValueError(f"Unknown cmd {cmd}")
 
+    def release_gpu(self):
+        with self._infer_lock:
+            _offload_vae_obj(self.vae)
+        log("VAE worker: offloaded to CPU after request")
+
+    def cleanup_after_job(self):
+        with self._infer_lock:
+            _offload_vae_obj(self.vae)
+            _empty_device_cache()
+        log("VAE worker: model off GPU, RAM trimmed")
+
 
 class SendRemoteVAE:
     _servers = {}
@@ -328,6 +443,14 @@ class SendRemoteVAE:
                     if cmd == "meta":
                         send_packet(conn, {"meta": worker.meta, "blob_size": 0})
                         continue
+                    if cmd == "cleanup":
+                        try:
+                            worker.cleanup_after_job()
+                            send_packet(conn, {"ok": True, "blob_size": 0})
+                        except Exception as e:
+                            log(f"Cleanup failed: {e}")
+                            send_packet(conn, {"error": str(e), "blob_size": 0})
+                        continue
                     if cmd not in ("decode", "decode_tiled", "encode", "encode_tiled"):
                         send_packet(conn, {"error": "bad request", "blob_size": 0})
                         continue
@@ -339,6 +462,8 @@ class SendRemoteVAE:
                         meta, blob = pack_tensors({"y": out}, transport_dtype)
                         send_packet(conn, {"tensors": meta, "blob_size": len(blob)}, blob)
                         log(f"Sent {cmd} result ({len(blob)} bytes)")
+                        del tensors, out, blob, blob_data
+                        worker.release_gpu()
                     except Exception as e:
                         log(f"{cmd} failed: {e}")
                         send_packet(conn, {"error": str(e), "blob_size": 0})
@@ -383,7 +508,9 @@ class LoadRemoteVAE:
 
     def load_remote(self, worker_ip, port, auth_token="", transport_precision="auto"):
         token = auth_token or os.environ.get("REMOTE_VAE_TOKEN", "")
-        return (RemoteVAE(worker_ip, port, token, transport_precision),)
+        vae = RemoteVAE(worker_ip, port, token, transport_precision)
+        _register_vae_worker(vae._conn)
+        return (vae,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -394,3 +521,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SendRemoteVAE": "Send Remote VAE",
     "LoadRemoteVAE": "Load Remote VAE",
 }
+
+try:
+    _install_master_cleanup_hook(_flush_vae_workers)
+except Exception as exc:
+    log(f"Could not install prompt-end VAE cleanup hook: {exc}")
